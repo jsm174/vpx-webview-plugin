@@ -1,0 +1,164 @@
+name: build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: webview-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.config }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2025-vs2026, platform: windows, arch: x64, config: Release }
+          - { os: windows-2025-vs2026, platform: windows, arch: x86, config: Release }
+          - { os: macos-15, platform: macos, arch: arm64, config: Release }
+          - { os: macos-15, platform: macos, arch: x64, config: Release }
+          - { os: ubuntu-24.04, platform: linux, arch: x64, config: Release }
+          - { os: ubuntu-24.04-arm, platform: linux, arch: aarch64, config: Release }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Version
+        run: |
+          VERSION_MAJOR=$(grep -Eo "WEBVIEW_PLUGIN_VERSION_MAJOR\s+[0-9]+" src/WebViewVersion.h | grep -Eo "[0-9]+$")
+          VERSION_MINOR=$(grep -Eo "WEBVIEW_PLUGIN_VERSION_MINOR\s+[0-9]+" src/WebViewVersion.h | grep -Eo "[0-9]+$")
+          VERSION_PATCH=$(grep -Eo "WEBVIEW_PLUGIN_VERSION_PATCH\s+[0-9]+" src/WebViewVersion.h | grep -Eo "[0-9]+$")
+          SHA_SHORT=$(git rev-parse --short "${GITHUB_SHA}")
+          echo "ARTIFACT_NAME=vpx-webview-plugin-${{ matrix.platform }}-${{ matrix.arch }}-${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}-${SHA_SHORT}" >> $GITHUB_ENV
+      - name: Calculate external cache hash
+        run: |
+          echo "EXT_HASH=$(cat platforms/config.sh platforms/${{ matrix.platform }}-${{ matrix.arch }}/external.sh | sha256sum | cut -c1-12)" >> $GITHUB_ENV
+      - name: Restore external cache
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            external
+            third-party/include/plugins
+          key: ${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.config }}-external-${{ env.EXT_HASH }}
+      - name: Build external cache
+        run: |
+          BUILD_TYPE=${{ matrix.config }} ./platforms/${{ matrix.platform }}-${{ matrix.arch }}/external.sh
+      - if: github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true'
+        name: Save external cache
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            external
+            third-party/include/plugins
+          key: ${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.config }}-external-${{ env.EXT_HASH }}
+      - name: Build
+        run: |
+          CMAKE_ARGS="-DPLATFORM=${{ matrix.platform }} -DARCH=${{ matrix.arch }}"
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            if [[ "${{ matrix.arch }}" == "x64" ]]; then
+              cmake ${CMAKE_ARGS} -G "Visual Studio 18 2026" -A x64 -B build/${{ matrix.config }}
+            else
+              cmake ${CMAKE_ARGS} -G "Visual Studio 18 2026" -A Win32 -B build/${{ matrix.config }}
+            fi
+            cmake --build build/${{ matrix.config }} --config ${{ matrix.config }} --parallel
+          elif [[ "${{ matrix.platform }}" == "macos" ]]; then
+            cmake ${CMAKE_ARGS} -DCMAKE_BUILD_TYPE=${{ matrix.config }} -B build/${{ matrix.config }}
+            cmake --build build/${{ matrix.config }} -- -j$(sysctl -n hw.ncpu)
+          else
+            cmake ${CMAKE_ARGS} -DCMAKE_BUILD_TYPE=${{ matrix.config }} -B build/${{ matrix.config }}
+            cmake --build build/${{ matrix.config }} -- -j$(nproc)
+          fi
+      - if: matrix.platform == 'macos' && vars.MACOS_CODESIGN == '1' && github.event_name != 'pull_request'
+        name: Code signing and notarization
+        working-directory: build/${{ matrix.config }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          echo "${{ secrets.MACOS_CODESIGN_P12 }}" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security create-keychain -p "${{ secrets.MACOS_CODESIGN_P12_PASSWORD }}" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "${{ secrets.MACOS_CODESIGN_P12_PASSWORD }}" $KEYCHAIN_PATH
+          security import $RUNNER_TEMP/certificate.p12 -P "${{ secrets.MACOS_CODESIGN_P12_PASSWORD }}" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+          FRAMEWORKS="webview/WebView.app/Contents/Frameworks"
+          codesign --verbose --timestamp --options runtime --force \
+            --sign "${{ secrets.MACOS_CODESIGN_DEVELOPER_ID }}" \
+            "${FRAMEWORKS}/Chromium Embedded Framework.framework/Libraries/"*.dylib
+          codesign --verbose --timestamp --options runtime --force \
+            --sign "${{ secrets.MACOS_CODESIGN_DEVELOPER_ID }}" \
+            "${FRAMEWORKS}/Chromium Embedded Framework.framework"
+          codesign --verbose --timestamp --options runtime --force \
+            --entitlements ../../src/helper/Helper.entitlements \
+            --sign "${{ secrets.MACOS_CODESIGN_DEVELOPER_ID }}" \
+            "${FRAMEWORKS}"/*.app
+          codesign --verbose --timestamp --options runtime --force \
+            --sign "${{ secrets.MACOS_CODESIGN_DEVELOPER_ID }}" \
+            webview/plugin-webview.dylib
+          ditto -c -k --keepParent webview webview-notarize.zip
+          xcrun notarytool submit webview-notarize.zip \
+            --wait \
+            --apple-id "${{ secrets.MACOS_CODESIGN_APPLE_ID }}" \
+            --password "${{ secrets.MACOS_CODESIGN_PASSWORD }}" \
+            --team-id "${{ secrets.MACOS_CODESIGN_TEAM_ID }}"
+          rm webview-notarize.zip
+      - name: Package
+        working-directory: build/${{ matrix.config }}
+        run: |
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            7z a -r ${ARTIFACT_NAME}.zip webview
+          else
+            tar czf ${ARTIFACT_NAME}.tar.gz webview
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: build/${{ matrix.config }}/${{ env.ARTIFACT_NAME }}.*
+          if-no-files-found: error
+          archive: false
+
+  release:
+    name: Publish latest release
+    if: github.event_name == 'push' && github.repository == 'jsm174/vpx-webview-plugin'
+    runs-on: ubuntu-24.04
+    needs: [ build ]
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: vpx-webview-plugin-*
+          skip-decompress: true
+      - name: Stage release assets
+        run: |
+          mkdir release
+          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) | while read -r FILE; do
+            NAME=$(basename "${FILE}" | sed -E 's/-[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]+(\.zip|\.tar\.gz)$/\1/')
+            cp "${FILE}" "release/${NAME}"
+          done
+          ls -l release
+      - name: Publish release
+        run: |
+          TITLE="Unofficial build ${GITHUB_SHA::7}"
+          cat > notes.md <<NOTES
+          **Unofficial build.** This is an experimental plugin for a personal project. It is not an official Visual Pinball project, and it is not endorsed or supported by the Visual Pinball team. Please do not report problems with it to the Visual Pinball project.
+
+          Rolling build of \`master\`, replaced on every successful push. The macOS builds are signed and notarized.
+          NOTES
+          if gh release view "${RELEASE_TAG}" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/${RELEASE_TAG}" -f sha="${GITHUB_SHA}" -F force=true
+            gh release upload "${RELEASE_TAG}" release/* --clobber --repo "${{ github.repository }}"
+            gh release edit "${RELEASE_TAG}" --title "${TITLE}" --notes-file notes.md --prerelease --repo "${{ github.repository }}"
+          else
+            gh release create "${RELEASE_TAG}" release/* --target "${GITHUB_SHA}" --title "${TITLE}" --notes-file notes.md --prerelease --repo "${{ github.repository }}"
+          fi

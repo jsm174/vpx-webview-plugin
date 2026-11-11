@@ -1,0 +1,5 @@
+build/
+external/
+third-party/include/*
+!third-party/include/.gitkeep
+.DS_Store

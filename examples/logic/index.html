@@ -1,0 +1,17 @@
+<!doctype html>
+<script>
+// A logic page with no picture: it reads and changes the table directly through vpx.table.
+// Here it turns gi2 off while the left flipper is up, and counts how often that happens.
+let raises = 0
+let wasUp = false
+
+vpx.watch(['LeftFlipper.CurrentAngle'], ([angle]) => {
+  const up = angle < 110
+  vpx.table.gi2.State = up ? 0 : 1
+  if (up && !wasUp) {
+    raises++
+    vpx.emit('raises', raises)
+  }
+  wasUp = up
+})
+</script>

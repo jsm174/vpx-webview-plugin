@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+  #score { position: absolute; inset: 0; display: grid; place-items: center; font: 900 72vh/1 system-ui, sans-serif; color: #fff; text-shadow: 0 0 0.15em #f0a, 0 0 0.4em #f0a; }
+</style>
+</head>
+<body>
+<div id="score">0</div>
+<script>
+const el = document.getElementById('score')
+vpx.on('score', (v) => { el.textContent = Number(v).toLocaleString() })
+</script>
+</body>
+</html>
